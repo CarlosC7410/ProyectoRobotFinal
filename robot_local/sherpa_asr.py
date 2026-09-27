@@ -1,0 +1,288 @@
+import os
+import re
+import json
+import math
+import wave
+import struct
+import subprocess
+import tempfile
+
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+SHERPA_MODEL_DIR = os.path.join(
+    BASE_DIR,
+    "modelos",
+    "sherpa",
+    "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8"
+)
+
+SHERPA_ENCODER = os.path.join(SHERPA_MODEL_DIR, "encoder.int8.onnx")
+SHERPA_DECODER = os.path.join(SHERPA_MODEL_DIR, "decoder.int8.onnx")
+SHERPA_TOKENS = os.path.join(SHERPA_MODEL_DIR, "tokens.txt")
+
+SAMPLE_RATE = 16000
+
+# Bajamos el tiempo para evitar mucho silencio al final.
+SEGUNDOS_GRABACION = 4
+
+# Si tu micrófono graba muy bajito, después podemos bajar este valor.
+MIN_RMS_AUDIO = 330
+
+# Para pruebas lo dejamos en True para ver el nivel del audio.
+DEBUG_AUDIO = True
+
+
+def verificar_sherpa():
+    archivos = [
+        SHERPA_ENCODER,
+        SHERPA_DECODER,
+        SHERPA_TOKENS,
+    ]
+
+    faltantes = [archivo for archivo in archivos if not os.path.isfile(archivo)]
+
+    if faltantes:
+        print("Faltan archivos del modelo Sherpa:")
+        for archivo in faltantes:
+            print(" -", archivo)
+        return False
+
+    return True
+
+
+def calcular_rms_wav(ruta_wav):
+    try:
+        with wave.open(ruta_wav, "rb") as wav:
+            canales = wav.getnchannels()
+            ancho = wav.getsampwidth()
+            frames = wav.getnframes()
+            datos = wav.readframes(frames)
+
+        if ancho != 2:
+            return 0
+
+        muestras = struct.iter_unpack("<h", datos)
+        suma = 0
+        total = 0
+
+        for muestra in muestras:
+            valor = muestra[0]
+            suma += valor * valor
+            total += 1
+
+        if total == 0:
+            return 0
+
+        rms = math.sqrt(suma / total)
+        return int(rms)
+
+    except Exception as e:
+        print("No pude calcular el nivel del audio:", e)
+        return 0
+
+
+def audio_tiene_voz(ruta_wav):
+    rms = calcular_rms_wav(ruta_wav)
+
+    if DEBUG_AUDIO:
+        print(f"Nivel de audio RMS: {rms}")
+
+    return rms >= MIN_RMS_AUDIO
+
+
+def limpiar_texto(texto):
+    if not texto:
+        return ""
+
+    texto = texto.strip()
+    texto = re.sub(r"\s+", " ", texto)
+    return texto
+
+
+def texto_es_basura(texto):
+    if not texto:
+        return True
+
+    texto_limpio = texto.lower().strip()
+    texto_limpio = re.sub(r"[^\wáéíóúñü\s]", "", texto_limpio)
+    palabras = texto_limpio.split()
+
+    if len(texto_limpio) < 4:
+        return True
+
+    # Evita resultados como: sí, sí, sí, sí...
+    if len(palabras) >= 8:
+        palabras_unicas = set(palabras)
+        if len(palabras_unicas) <= 2:
+            return True
+
+    repeticiones_ruido = [
+        "sí sí sí",
+        "si si si",
+        "no no no",
+        "ah ah ah",
+        "eh eh eh",
+    ]
+
+    for patron in repeticiones_ruido:
+        if patron in texto_limpio:
+            return True
+
+    frases_basura = [
+        "oh lah",
+        "hola",
+        "simula",
+        "que no sé",
+        "que no se",
+        "y se lo dijo",
+        "a la gente",
+        "de la película",
+        "de la pelicula",
+    ]
+
+    for frase in frases_basura:
+        if frase in texto_limpio:
+            return True
+
+    # Si solamente entendió "robot", no es una orden completa.
+    if texto_limpio in ["robot", "charsbotai", "charsbotai robot"]:
+        return True
+    
+    return False
+
+
+def corregir_texto_sherpa(texto):
+    texto = limpiar_texto(texto)
+
+    if not texto:
+        return ""
+
+    correcciones = {
+        "charloté robot": "charsbotai robot",
+        "charlote robot": "charsbotai robot",
+        "charlotte robot": "charsbotai robot",
+        "charlo te robot": "charsbotai robot",
+        "charbotay": "charsbotai",
+        "char botay": "charsbotai",
+        "char bot ai": "charsbotai",
+        "chars bot ai": "charsbotai",
+        "charbotai": "charsbotai",
+        "charles bot ai": "charsbotai",
+        "charlos bot ai": "charsbotai",
+        "charlottei": "charsbotai",
+        "charlotte i": "charsbotai",
+        "charlotte dime": "charsbotai dime",
+        "ponkara feliz": "pon cara feliz",
+        "pon kara feliz": "pon cara feliz",
+        "apaga el fondo": "apaga el foco",
+        "apaga el fondo de la película": "apaga el foco",
+        "encender foco": "enciende el foco",
+
+        # Correcciones comunes para comandos.
+        "encima del foco": "enciende el foco",
+        "encima la luz": "enciende la luz",
+        "encima las luces": "enciende las luces",
+    }
+
+    texto_corregido = texto
+
+    for incorrecto, correcto in correcciones.items():
+        texto_corregido = re.sub(
+            incorrecto,
+            correcto,
+            texto_corregido,
+            flags=re.IGNORECASE
+        )
+
+    return limpiar_texto(texto_corregido)
+
+
+def grabar_audio_temporal(segundos=SEGUNDOS_GRABACION):
+    archivo_temporal = tempfile.NamedTemporaryFile(
+        suffix=".wav",
+        delete=False
+    )
+
+    ruta_wav = archivo_temporal.name
+    archivo_temporal.close()
+
+    comando = [
+        "timeout",
+        f"{segundos}s",
+        "parecord",
+        "--channels=1",
+        f"--rate={SAMPLE_RATE}",
+        "--format=s16le",
+        "--file-format=wav",
+        ruta_wav,
+    ]
+
+    subprocess.run(
+        comando,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    return ruta_wav
+
+
+def reconocer_archivo_sherpa(ruta_wav):
+    if not verificar_sherpa():
+        return ""
+
+    if not audio_tiene_voz(ruta_wav):
+        return ""
+
+    comando = [
+        "sherpa-onnx-offline",
+        f"--canary-encoder={SHERPA_ENCODER}",
+        f"--canary-decoder={SHERPA_DECODER}",
+        f"--tokens={SHERPA_TOKENS}",
+        "--canary-src-lang=es",
+        "--canary-tgt-lang=es",
+        ruta_wav,
+    ]
+
+    resultado = subprocess.run(
+        comando,
+        capture_output=True,
+        text=True
+    )
+
+    salida = (resultado.stdout or "") + "\n" + (resultado.stderr or "")
+
+    for linea in salida.splitlines():
+        linea = linea.strip()
+
+        if linea.startswith("{") and '"text"' in linea:
+            try:
+                data = json.loads(linea)
+                texto = data.get("text", "").strip()
+                texto = corregir_texto_sherpa(texto)
+
+                if texto_es_basura(texto):
+                    return ""
+
+                return texto
+
+            except Exception:
+                pass
+
+    return ""
+
+
+def escuchar_sherpa(segundos=SEGUNDOS_GRABACION):
+    ruta_wav = None
+
+    try:
+        ruta_wav = grabar_audio_temporal(segundos=segundos)
+        texto = reconocer_archivo_sherpa(ruta_wav)
+        return texto
+
+    finally:
+        if ruta_wav and os.path.exists(ruta_wav):
+            try:
+                os.remove(ruta_wav)
+            except Exception:
+                pass
