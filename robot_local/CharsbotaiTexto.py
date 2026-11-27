@@ -13,7 +13,17 @@ import struct
 import shutil
 import tempfile
 import signal
+import select
+import threading
 from collections import deque
+
+# Control del sistema: consultas de fecha, hora y estado general.
+if __package__:
+    from .modulos.control_sistema import responder_fecha_hora, responder_estado_general, responder_control_software, responder_dialogo_archivos, actualizar_dialogo_archivos, responder_consulta_internet, responder_dialogo_investigacion, actualizar_dialogo_investigacion, iniciar_control_escritorio, cerrar_control_escritorio
+    from .modulos.camara import responder_camara, actualizar_dialogo_camara, cerrar_camara, iniciar_vision_al_arrancar, consultar_estado_vision, consultar_estado_disco_externo, ControlSaludos, consultar_muestra_saludo
+else:
+    from modulos.control_sistema import responder_fecha_hora, responder_estado_general, responder_control_software, responder_dialogo_archivos, actualizar_dialogo_archivos, responder_consulta_internet, responder_dialogo_investigacion, actualizar_dialogo_investigacion, iniciar_control_escritorio, cerrar_control_escritorio
+    from modulos.camara import responder_camara, actualizar_dialogo_camara, cerrar_camara, iniciar_vision_al_arrancar, consultar_estado_vision, consultar_estado_disco_externo, ControlSaludos, consultar_muestra_saludo
 
 NUMPY_IMPORT_ERROR = None
 SHERPA_ONNX_IMPORT_ERROR = None
@@ -108,7 +118,10 @@ LLM_NUM_CTX = 1024
 LLM_SYSTEM_FAST = (
     "Eres Charsbotai. Responde en español, directo y natural. "
     "No saludes salvo que el usuario te salude. "
-    "No inventes datos. Si piden brevedad, responde muy breve."
+    "No inventes datos. Si piden brevedad, responde muy breve. "
+    "Continúa el diálogo si necesitas una respuesta del usuario. "
+    "Haz preguntas de seguimiento solo cuando sean naturales o necesarias; "
+    "no termines todas las respuestas con una pregunta."
 )
 
 # Voz en streaming:
@@ -116,6 +129,20 @@ LLM_SYSTEM_FAST = (
 # - fragmentos posteriores más largos para hablar de forma fluida.
 LLM_PRIMER_FRAGMENTO_PALABRAS = 8
 LLM_FRAGMENTO_PALABRAS = 26
+
+# Conversación continua selectiva: tiempo para EMPEZAR a contestar.
+# Se cuenta a partir de que termina la voz del robot, no de que Ollama
+# empieza a generar. No modifica el tiempo de captura de una frase.
+CONVERSACION_CONTINUA = True
+CONVERSACION_ESPERA_SEGUNDOS = 18.0
+
+# Animación sincronizada con la señal de salida, nunca con el micrófono.
+# Valores iniciales ajustables según el volumen y la latencia del audio.
+ANIMACION_VOZ_SINCRONIZADA = True
+ANIMACION_VOZ_RMS_INICIO = 180
+ANIMACION_VOZ_RMS_FIN = 100
+ANIMACION_VOZ_BLOQUE_MS = 20
+ANIMACION_VOZ_SILENCIO_MS = 120
 
 # Filtro adicional para el modo de respaldo RMS.
 SHERPA_MIN_VOICED_FRAMES = 2
@@ -213,6 +240,18 @@ SILERO_VAD_ACTIVO = False
 # Evita mensajes de Socket.IO y voz de despedida mientras Ctrl+C
 # está cerrando el programa.
 APAGANDO = False
+
+# Solo se abre una continuación si la respuesta realmente terminó de sonar.
+# hablar() mantiene su retorno original (True = orden de interrupción).
+ULTIMA_VOZ_COMPLETA = False
+MONITOR_TTS_AVISADO = False
+
+# El proveedor real se añadirá con la telemetría del Arduino Mega.
+# None bloquea los saludos sin sondear la cámara ni cambiar la escucha.
+PROVEEDOR_PROXIMIDAD_SALUDOS = None
+CONTROL_SALUDOS = ControlSaludos()
+SILENCIO_VERIFICADO_SALUDO = False
+ULTIMA_EMOCION_SALUDO = ("neutral", "state")
 
 
 def conectar_socket():
@@ -755,7 +794,8 @@ def ejecutar_comando_domotico(comando):
         return f"Ocurrió un error al ejecutar el comando domótico: {e}"
 
 def enviar_emocion(emotion, modo="state", duracion_ms=None):
-    global socket_conectado
+    global socket_conectado, ULTIMA_EMOCION_SALUDO
+    ULTIMA_EMOCION_SALUDO = (emotion, modo)
 
     if APAGANDO:
         return
@@ -1492,6 +1532,133 @@ def capturar_bloque_audio(microfono, duracion_segundos=1.25):
                     pass
 
 
+def obtener_monitor_salida_tts():
+    """Localiza el monitor de la salida que utiliza eSpeak, sin cambiarla."""
+    try:
+        salida = SALIDA_TTS or os.environ.get("PULSE_SINK")
+        if not salida:
+            salida = subprocess.run(
+                ["pactl", "get-default-sink"], capture_output=True,
+                text=True, timeout=1, check=True
+            ).stdout.strip()
+
+        fuentes = subprocess.run(
+            ["pactl", "list", "short", "sources"], capture_output=True,
+            text=True, timeout=1, check=True
+        ).stdout.splitlines()
+        monitor = f"{salida}.monitor"
+        if any(len(linea.split()) >= 2 and linea.split()[1] == monitor
+               for linea in fuentes):
+            return monitor
+
+        # Si la salida virtual AEC no expone monitor, intentar el de la
+        # salida física predeterminada (si sigue siendo la salida del AEC).
+        if SALIDA_TTS and salida == SALIDA_TTS:
+            salida_default = subprocess.run(
+                ["pactl", "get-default-sink"], capture_output=True,
+                text=True, timeout=1, check=True
+            ).stdout.strip()
+            monitor = f"{salida_default}.monitor"
+            if salida_default != salida and any(
+                len(linea.split()) >= 2 and linea.split()[1] == monitor
+                for linea in fuentes
+            ):
+                return monitor
+    except Exception:
+        pass
+    return None
+
+
+def vigilar_animacion_voz(proceso_monitor, detener):
+    """Lee PCM de la salida y cambia la cara solo al detectar voz o pausa."""
+    estado_hablando = False
+    silencio_ms = 0
+    bytes_bloque = SAMPLE_RATE * 2 * ANIMACION_VOZ_BLOQUE_MS // 1000
+    buffer = bytearray()
+    ultimo_audio = time.monotonic()
+
+    try:
+        while not detener.is_set():
+            prontos, _, _ = select.select([proceso_monitor.stdout], [], [], 0.05)
+            if not prontos:
+                if time.monotonic() - ultimo_audio > 0.6:
+                    raise RuntimeError("El monitor no entrega audio")
+                continue
+
+            data = os.read(proceso_monitor.stdout.fileno(), 4096)
+            if not data:
+                raise RuntimeError("El monitor de audio se cerró")
+            ultimo_audio = time.monotonic()
+            buffer.extend(data)
+
+            while len(buffer) >= bytes_bloque and not detener.is_set():
+                bloque = bytes(buffer[:bytes_bloque])
+                del buffer[:bytes_bloque]
+                rms = calcular_rms_pcm(bloque)
+
+                if not estado_hablando:
+                    if rms >= ANIMACION_VOZ_RMS_INICIO:
+                        enviar_emocion("speaking", modo="state")
+                        estado_hablando = True
+                        silencio_ms = 0
+                elif rms >= ANIMACION_VOZ_RMS_FIN:
+                    silencio_ms = 0
+                else:
+                    silencio_ms += ANIMACION_VOZ_BLOQUE_MS
+                    if silencio_ms >= ANIMACION_VOZ_SILENCIO_MS:
+                        enviar_emocion("neutral", modo="state")
+                        estado_hablando = False
+                        silencio_ms = 0
+
+    except Exception as e:
+        if not detener.is_set() and not APAGANDO:
+            print(f"[Animación] Monitor no disponible: {e}. Usaré el fragmento de voz.")
+            if not estado_hablando:
+                enviar_emocion("speaking", modo="state")
+
+
+def iniciar_monitor_animacion():
+    """Abre un monitor de solo lectura; no cambia ni graba el audio a disco."""
+    global MONITOR_TTS_AVISADO
+    monitor = obtener_monitor_salida_tts()
+    if not monitor:
+        if not MONITOR_TTS_AVISADO:
+            print("[Animación] No encontré un monitor de salida. Usaré animación por fragmentos.")
+            MONITOR_TTS_AVISADO = True
+        return None
+
+    try:
+        return subprocess.Popen(
+            ["parec", "--device", monitor, "--rate", str(SAMPLE_RATE),
+             "--channels", "1", "--format", "s16le", "--latency-msec=40",
+             "--process-time-msec=20"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0
+        )
+    except Exception:
+        return None
+
+
+def cerrar_monitor_animacion(proceso_monitor, detener, hilo):
+    """Cierra el monitor antes de mostrar la emoción final de la respuesta."""
+    detener.set()
+    if hilo is not None and hilo.is_alive():
+        hilo.join()
+    if proceso_monitor is None:
+        return
+    try:
+        proceso_monitor.terminate()
+        proceso_monitor.wait(timeout=0.5)
+    except Exception:
+        try:
+            proceso_monitor.kill()
+            proceso_monitor.wait(timeout=0.5)
+        except Exception:
+            pass
+    finally:
+        if proceso_monitor.stdout is not None:
+            proceso_monitor.stdout.close()
+
+
 def hablar(texto, aplicar_emocion_final=True):
     """
     Hace que Charsbotai hable usando espeak-ng.
@@ -1505,8 +1672,13 @@ def hablar(texto, aplicar_emocion_final=True):
     - un detector auxiliar muy restringido escucha solo órdenes de parar.
     """
     global emocion_final_pendiente, emocion_final_modo_pendiente
+    global ULTIMA_VOZ_COMPLETA
 
+    ULTIMA_VOZ_COMPLETA = False
     proceso_voz = None
+    proceso_monitor = None
+    hilo_animacion = None
+    detener_animacion = threading.Event()
     interrumpido = False
     texto_interrupcion = ""
 
@@ -1517,15 +1689,17 @@ def hablar(texto, aplicar_emocion_final=True):
             emocion_final_pendiente = None
             emocion_final_modo_pendiente = "state"
         else:
-            # En streaming cada fragmento conserva la cara "speaking".
+            # En streaming la emoción final se aplica al terminar toda
+            # la respuesta, no al terminar cada fragmento.
             emocion_final = None
             modo_final = "state"
 
-        enviar_emocion("speaking", modo="state")
+        # Se conserva el proceso de voz original. El monitor solo lee su
+        # salida y permite cerrar la boca durante las pausas reales.
+        if socket_conectado and ANIMACION_VOZ_SINCRONIZADA:
+            proceso_monitor = iniciar_monitor_animacion()
 
-        # En streaming ya venimos hablando. Evitamos agregar una pausa
-        # artificial entre fragmentos. Para una respuesta normal se conserva
-        # la pequeña espera original.
+        # Conservamos la pequeña espera original en las respuestas normales.
         if aplicar_emocion_final:
             time.sleep(0.05)
 
@@ -1541,6 +1715,16 @@ def hablar(texto, aplicar_emocion_final=True):
             env=entorno,
             start_new_session=True
         )
+
+        if proceso_monitor is not None:
+            hilo_animacion = threading.Thread(
+                target=vigilar_animacion_voz,
+                args=(proceso_monitor, detener_animacion), daemon=True
+            )
+            hilo_animacion.start()
+        else:
+            # Si no hay monitor, mantenemos la animación por fragmento.
+            enviar_emocion("speaking", modo="state")
 
         vigilar_interrupcion = (
             MICROFONO_ACTUAL is not None
@@ -1572,6 +1756,13 @@ def hablar(texto, aplicar_emocion_final=True):
             if not interrumpido and proceso_voz.poll() is None:
                 proceso_voz.wait()
 
+        # La escucha de interrupciones continúa siendo la original.
+        # El monitor se cierra primero para evitar que sus eventos
+        # sobrescriban la expresión final o la de interrupción.
+        cerrar_monitor_animacion(proceso_monitor, detener_animacion, hilo_animacion)
+        proceso_monitor = None
+        ULTIMA_VOZ_COMPLETA = not interrumpido and proceso_voz.returncode == 0
+
         if interrumpido:
             print(f"\nTú dijiste mientras hablaba: {texto_interrupcion}")
             print("Charsbotai: Dejé de hablar.\n")
@@ -1589,7 +1780,9 @@ def hablar(texto, aplicar_emocion_final=True):
             enviar_emocion("neutral", modo="state")
 
         else:
-            enviar_emocion("speaking", modo="state")
+            # Ya no hay voz: mostrar la cara normal durante la espera
+            # hasta que Ollama entregue el próximo fragmento.
+            enviar_emocion("neutral", modo="state")
 
         return interrumpido
 
@@ -1598,11 +1791,18 @@ def hablar(texto, aplicar_emocion_final=True):
         raise
 
     except Exception as e:
+        ULTIMA_VOZ_COMPLETA = False
+        detener_proceso_voz(proceso_voz)
+        cerrar_monitor_animacion(proceso_monitor, detener_animacion, hilo_animacion)
+        proceso_monitor = None
         if not APAGANDO:
             print(f"[Error de voz]: {e}")
             enviar_emocion("sad")
-        detener_proceso_voz(proceso_voz)
         return False
+
+    finally:
+        if proceso_monitor is not None:
+            cerrar_monitor_animacion(proceso_monitor, detener_animacion, hilo_animacion)
 
 
 def limpiar_texto(texto):
@@ -1774,20 +1974,22 @@ def cortar_por_palabras(buffer, cantidad):
     """
     Corta en un límite de palabra, nunca a mitad de una palabra.
     """
-    matches = list(re.finditer(r"\S+", buffer))
+    # Ollama transmite tokens, no palabras completas. El final del buffer
+    # NO confirma una palabra: puede llegar después el resto de sus letras.
+    # Solo contamos palabras que ya tienen un espacio confirmado detrás.
+    matches = list(re.finditer(r"\S+(?=\s)", buffer))
 
     if len(matches) < cantidad:
         return None, buffer
 
     fin = matches[cantidad - 1].end()
 
-    # Si hay puntuación natural muy cerca, preferirla.
-    ventana_fin = min(len(buffer), fin + 35)
-    ventana = buffer[fin:ventana_fin]
-    m = re.search(r"[,;:.!?]", ventana)
-
-    if m:
-        fin = fin + m.end()
+    # Si hay puntuación natural muy cerca, preferirla, pero únicamente
+    # si también termina una unidad completa (ya llegó un espacio).
+    for m in re.finditer(r"[,;:.!?]+(?=\s)", buffer):
+        if fin <= m.end() <= fin + 35:
+            fin = m.end()
+            break
 
     fragmento = buffer[:fin].strip()
     resto = buffer[fin:].lstrip()
@@ -1816,7 +2018,7 @@ def extraer_fragmento_hablable(buffer, primer_fragmento=False):
 
     if primer_fragmento:
         # Para empezar rápido sí aceptamos una frontera natural corta.
-        for m in re.finditer(r"[,;:.!?]+", buffer):
+        for m in re.finditer(r"[,;:.!?]+(?=\s)", buffer):
             candidato = buffer[:m.end()].strip()
 
             if len(candidato.split()) >= 6:
@@ -1829,7 +2031,7 @@ def extraer_fragmento_hablable(buffer, primer_fragmento=False):
 
     # Después del primer bloque buscamos principalmente final de oración.
     # No cortamos por cada coma, que era lo que producía demasiadas pausas.
-    for m in re.finditer(r"[.!?]+", buffer):
+    for m in re.finditer(r"[.!?]+(?=\s)", buffer):
         candidato = buffer[:m.end()].strip()
 
         # Si la oración/bloque ya tiene una longitud razonable, se habla
@@ -1856,6 +2058,11 @@ def preguntar_llm_streaming_y_hablar(mensaje):
 
     Si el usuario dice 'cállate', se corta espeak-ng y se cancela la respuesta.
     """
+    global ULTIMA_VOZ_COMPLETA
+    ULTIMA_VOZ_COMPLETA = False
+    voz_completa = True
+    hubo_voz = False
+
     historial.append({"role": "user", "content": mensaje})
 
     respuesta_muy_breve = usuario_pide_respuesta_breve(mensaje)
@@ -1933,14 +2140,16 @@ def preguntar_llm_streaming_y_hablar(mensaje):
                 respuesta_completa += contenido
                 buffer_habla += contenido
 
-                # Antes del primer bloque impedimos que un saludo de Qwen llegue
-                # al TTS. Se aplica repetidamente mientras llega el inicio.
-                if primer_fragmento:
-                    buffer_habla = quitar_saludo_inicial_llm(buffer_habla)
-
             while True:
+                # Limpiar el saludo solo en el primer bloque y sin alterar
+                # el buffer original hasta tener un fragmento confirmado.
+                # Así no se pierde texto de un token todavía incompleto.
+                candidato = (
+                    quitar_saludo_inicial_llm(buffer_habla)
+                    if primer_fragmento else buffer_habla
+                )
                 fragmento, resto = extraer_fragmento_hablable(
-                    buffer_habla,
+                    candidato,
                     primer_fragmento=primer_fragmento
                 )
 
@@ -1961,8 +2170,10 @@ def preguntar_llm_streaming_y_hablar(mensaje):
                 texto_hablado += (" " if texto_hablado else "") + fragmento
                 primer_fragmento = False
 
-                if hablar(fragmento, aplicar_emocion_final=False):
-                    interrumpido = True
+                interrumpido = hablar(fragmento, aplicar_emocion_final=False)
+                hubo_voz = True
+                voz_completa = voz_completa and ULTIMA_VOZ_COMPLETA
+                if interrumpido:
                     break
 
             if interrumpido:
@@ -1971,9 +2182,11 @@ def preguntar_llm_streaming_y_hablar(mensaje):
             if data.get("done"):
                 break
 
-        # Pronunciar lo que quede al finalizar la generación.
+        # Pronunciar lo que quede al finalizar la generación. Solo ahora
+        # podemos aceptar la última palabra sin un espacio posterior.
         if not interrumpido:
-            buffer_habla = quitar_saludo_inicial_llm(buffer_habla)
+            if primer_fragmento:
+                buffer_habla = quitar_saludo_inicial_llm(buffer_habla)
             resto_final = buffer_habla.strip()
 
             if resto_final:
@@ -1988,8 +2201,9 @@ def preguntar_llm_streaming_y_hablar(mensaje):
                 print(resto_final, end=" ", flush=True)
                 texto_hablado += (" " if texto_hablado else "") + resto_final
 
-                if hablar(resto_final, aplicar_emocion_final=False):
-                    interrumpido = True
+                interrumpido = hablar(resto_final, aplicar_emocion_final=False)
+                hubo_voz = True
+                voz_completa = voz_completa and ULTIMA_VOZ_COMPLETA
 
         print()
 
@@ -2021,6 +2235,7 @@ def preguntar_llm_streaming_y_hablar(mensaje):
             )
         # Si fue interrumpido, hablar() ya dejó la cara annoyed.
 
+        ULTIMA_VOZ_COMPLETA = hubo_voz and voz_completa and not interrumpido
         return respuesta_guardada
 
     except Exception as e:
@@ -2032,6 +2247,7 @@ def preguntar_llm_streaming_y_hablar(mensaje):
         if not interrumpido:
             hablar(error)
 
+        ULTIMA_VOZ_COMPLETA = False
         return error
 
     finally:
@@ -2226,6 +2442,33 @@ def ejecutar_solicitud_expresion(emotion):
     fijar_emocion_final(emotion, modo="manual")
     return RESPUESTAS_EXPRESION.get(emotion, "Claro, cambié mi expresión.")
 
+def consultar_estado_ollama():
+    """Consulta el catálogo local; no genera texto ni carga un modelo."""
+    try:
+        respuesta = requests.get(OLLAMA_URL.rsplit("/", 1)[0] + "/tags", timeout=2)
+        respuesta.raise_for_status()
+        modelos = respuesta.json().get("models")
+        if not isinstance(modelos, list):
+            return "Ollama respondió, pero no pude comprobar su catálogo de modelos."
+        if any(isinstance(m, dict) and MODEL in (m.get("name"), m.get("model")) for m in modelos):
+            return "Ollama responde y el modelo de conversación está disponible localmente."
+        return "Ollama responde, pero no encontré el modelo de conversación configurado."
+    except Exception:
+        return "No pude comprobar la disponibilidad de Ollama."
+
+
+def consultar_estado_general_robot(mensaje):
+    return responder_estado_general(
+        mensaje, consultar_vision=consultar_estado_vision,
+        consultar_backend=obtener_estado_domotico, consultar_ollama=consultar_estado_ollama,
+        sherpa_en_memoria=SHERPA_RECOGNIZER is not None,
+        silero_activo=SILERO_VAD_ACTIVO, vosk_en_memoria=VOSK_STOP_MODEL is not None,
+        consultar_disco=consultar_estado_disco_externo, microfono=MICROFONO_ACTUAL,
+        salida_tts=SALIDA_TTS or os.environ.get("PULSE_SINK"),
+        consultar_saludos=lambda: CONTROL_SALUDOS.estado(callable(PROVEEDOR_PROXIMIDAD_SALUDOS)),
+    )
+
+
 def procesar_mensaje(mensaje):
     """
     Decide si el mensaje es consulta de sensores, comando domótico o conversación normal.
@@ -2260,6 +2503,63 @@ def procesar_mensaje(mensaje):
     if expresion:
         resetear_confusiones()
         return ejecutar_solicitud_expresion(expresion)
+
+    # Los saludos se controlan localmente, antes de la domótica y Ollama.
+    respuesta_saludo = CONTROL_SALUDOS.responder(mensaje, callable(PROVEEDOR_PROXIMIDAD_SALUDOS))
+    if respuesta_saludo is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_saludo
+
+    # Fecha y hora reales del sistema, sin generar datos con Ollama.
+    respuesta_sistema = responder_fecha_hora(mensaje)
+    if respuesta_sistema is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_sistema
+
+    # Selección de archivos vigente: prioridad frente a "abre la foto" de cámara.
+    respuesta_archivos = responder_dialogo_archivos(mensaje)
+    if respuesta_archivos is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_archivos
+
+    # Respuesta sí/no a una consulta de información reciente o exacta.
+    # La pregunta ha sido ofrecida explícitamente por el robot; nunca
+    # navegación remota automática sin aceptación del usuario.
+    respuesta_consulta_pendiente = responder_dialogo_investigacion(mensaje)
+    if respuesta_consulta_pendiente is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_consulta_pendiente
+
+    # Órdenes de cámara: se resuelven localmente, sin enviar al LLM.
+    respuesta_camara = responder_camara(mensaje)
+    if respuesta_camara is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_camara
+
+    # Diagnóstico del propio robot, antes de las consultas domóticas genéricas.
+    respuesta_general = consultar_estado_general_robot(mensaje)
+    if respuesta_general is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_general
+
+    # Control local de aplicaciones, archivos y navegador.
+    respuesta_software = responder_control_software(mensaje)
+    if respuesta_software is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_software
+
+    respuesta_internet = responder_consulta_internet(mensaje)
+    if respuesta_internet is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_internet
 
     consulta_sensor = detectar_consulta_sensor(mensaje)
 
@@ -2324,6 +2624,63 @@ def procesar_mensaje_con_streaming(mensaje):
     if expresion:
         resetear_confusiones()
         return ejecutar_solicitud_expresion(expresion), False
+
+    # Los saludos se controlan localmente, antes de la domótica y Ollama.
+    respuesta_saludo = CONTROL_SALUDOS.responder(mensaje, callable(PROVEEDOR_PROXIMIDAD_SALUDOS))
+    if respuesta_saludo is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_saludo, False
+
+    # Fecha y hora reales del sistema, sin generar datos con Ollama.
+    respuesta_sistema = responder_fecha_hora(mensaje)
+    if respuesta_sistema is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_sistema, False
+
+    # Selección de archivos vigente: prioridad frente a "abre la foto" de cámara.
+    respuesta_archivos = responder_dialogo_archivos(mensaje)
+    if respuesta_archivos is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_archivos, False
+
+    # Respuesta sí/no a una consulta de información reciente o exacta.
+    # La pregunta ha sido ofrecida explícitamente por el robot; nunca
+    # navegación remota automática sin aceptación del usuario.
+    respuesta_consulta_pendiente = responder_dialogo_investigacion(mensaje)
+    if respuesta_consulta_pendiente is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_consulta_pendiente, False
+
+    # Órdenes de cámara: se resuelven localmente, sin enviar al LLM.
+    respuesta_camara = responder_camara(mensaje)
+    if respuesta_camara is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_camara, False
+
+    # Diagnóstico del propio robot, antes de las consultas domóticas genéricas.
+    respuesta_general = consultar_estado_general_robot(mensaje)
+    if respuesta_general is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_general, False
+
+    # Control local de aplicaciones, archivos y navegador.
+    respuesta_software = responder_control_software(mensaje)
+    if respuesta_software is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_software, False
+
+    respuesta_internet = responder_consulta_internet(mensaje)
+    if respuesta_internet is not None:
+        resetear_confusiones()
+        fijar_emocion_final("neutral", modo="state")
+        return respuesta_internet, False
 
     consulta_sensor = detectar_consulta_sensor(mensaje)
     if consulta_sensor:
@@ -2947,6 +3304,9 @@ def capturar_frase_vad(
 
     Esto ayuda con cualquier petición y reduce palabras perdidas al inicio.
     """
+    global SILENCIO_VERIFICADO_SALUDO
+    SILENCIO_VERIFICADO_SALUDO = False
+
     if not SILERO_VAD_ACTIVO or SILERO_VAD is None or np is None:
         return None
 
@@ -3036,6 +3396,7 @@ def capturar_frase_vad(
                 not voz_mostrada
                 and time.time() - inicio_espera >= tiempo_espera
             ):
+                SILENCIO_VERIFICADO_SALUDO = True
                 return None
 
     finally:
@@ -3094,6 +3455,9 @@ def capturar_frase_sherpa(
     - Termina después de un breve silencio.
     - Limita una frase a 10 s.
     """
+    global SILENCIO_VERIFICADO_SALUDO
+    SILENCIO_VERIFICADO_SALUDO = False
+
     if tiempo_espera is None:
         tiempo_espera = SHERPA_WAIT_FOR_VOICE_SECONDS
 
@@ -3156,6 +3520,7 @@ def capturar_frase_sherpa(
                     continue
 
                 if time.time() - inicio_espera >= tiempo_espera:
+                    SILENCIO_VERIFICADO_SALUDO = True
                     return None
 
                 continue
@@ -3229,6 +3594,101 @@ def modo_solo_voz_sherpa(microfono):
         return
 
 
+def respuesta_requiere_contestacion(respuesta):
+    """Detecta una invitación real a contestar al final de la respuesta.
+
+    El criterio es conservador: una pregunta explicada por el propio robot
+    o una pregunta citada no mantiene abierta la escucha. También acepta
+    peticiones directas como 'Cuéntame qué pasó' o 'Repítelo más claro'.
+    No hace una segunda consulta a Ollama ni altera lo que se pronuncia.
+    """
+    if not respuesta:
+        return False
+
+    original = respuesta.strip()
+    # Retirar preguntas citadas (incluidos ejemplos entre comillas), no
+    # solo comprobar la presencia de un signo de interrogación cualquiera.
+    sin_citas = re.sub(r'"[^"\n]*"|“[^”]*”|«[^»]*»|‘[^’]*’', ' ', original)
+    sin_citas = re.sub(r"'[^'\n]*'", ' ', sin_citas).strip()
+    if not sin_citas:
+        return False
+
+    # La pregunta debe quedar pendiente al terminar de hablar. No se abre
+    # un turno si después de la pregunta el robot dio su propia respuesta.
+    if sin_citas.rstrip().endswith("?"):
+        pregunta = re.split(r"[.!?]+", sin_citas.rstrip()[:-1])[-1]
+        pregunta = normalizar_texto(pregunta).strip(" ¿?,;:!\t\n")
+        if pregunta:
+            # Ejemplos educativos y preguntas retóricas habituales.
+            if re.search(
+                r"\b(?:por ejemplo|un ejemplo|la pregunta es|la pregunta seria|"
+                r"pregunta retorica|quien sabe|quien lo diria)\b", pregunta
+            ):
+                return False
+            return True
+
+    # Peticiones de respuesta que no llevan signos de interrogación.
+    # Analizar únicamente la última oración, no las instrucciones citadas
+    # o mencionadas dentro de una explicación anterior.
+    ultimo = re.split(r"[.!?]+", sin_citas.rstrip(".!? "))[-1]
+    ultimo = normalizar_texto(ultimo).strip(" ,;:¿¡\t\n")
+    return bool(re.match(
+        r"^(?:(?:y|ahora|por favor|entonces)\s*[,;:]?\s+)*"
+        r"(?:cuentame|dime|dimelo|dinos|explicame|aclarame|respondeme|"
+        r"responde|contestame|contesta|repite|repitelo|especifica|elige|"
+        r"indicame|confirmame|confirma|hazme saber|dejame saber|"
+        r"te escucho|(?:espero|necesito) (?:tu respuesta|que me (?:digas|confirmes|aclares)))\b",
+        ultimo
+    ))
+
+
+def estado_despues_de_responder(respuesta):
+    """Devuelve modo activo y su plazo, solo si se espera una contestación."""
+    actualizar_dialogo_archivos(respuesta, CONVERSACION_CONTINUA and ULTIMA_VOZ_COMPLETA,
+                                CONVERSACION_ESPERA_SEGUNDOS)
+    actualizar_dialogo_camara(respuesta, CONVERSACION_CONTINUA and ULTIMA_VOZ_COMPLETA,
+                              CONVERSACION_ESPERA_SEGUNDOS)
+    actualizar_dialogo_investigacion(respuesta, CONVERSACION_CONTINUA and ULTIMA_VOZ_COMPLETA,
+                                    CONVERSACION_ESPERA_SEGUNDOS)
+    if (CONVERSACION_CONTINUA and ULTIMA_VOZ_COMPLETA
+            and respuesta_requiere_contestacion(respuesta)):
+        print(f"Charsbotai espera tu respuesta ({CONVERSACION_ESPERA_SEGUNDOS:g} s). "
+              "No necesitas repetir 'robot'.\n")
+        return True, time.monotonic() + CONVERSACION_ESPERA_SEGUNDOS
+
+    print("Charsbotai volvió al modo espera.\n")
+    return False, None
+
+
+def saludos_listos_para_sondeo(activo):
+    return (callable(PROVEEDOR_PROXIMIDAD_SALUDOS) and CONTROL_SALUDOS.habilitado
+            and not activo and not APAGANDO and not sleeping_sent
+            and ULTIMA_EMOCION_SALUDO[0] not in {"sleeping", "thinking", "speaking", "listening"}
+            and ULTIMA_EMOCION_SALUDO[1] != "manual")
+
+
+def revisar_saludo_en_silencio(activo):
+    # Solo hilo principal, después de una captura que terminó por silencio.
+    # Nunca usar un hilo de TTS que compita con Sherpa o con una conversación.
+    if not SILENCIO_VERIFICADO_SALUDO or not saludos_listos_para_sondeo(activo):
+        CONTROL_SALUDOS.reiniciar_muestras()
+        return
+    try:
+        visual = consultar_muestra_saludo()
+        distancia = PROVEEDOR_PROXIMIDAD_SALUDOS()
+        if not CONTROL_SALUDOS.evaluar(visual, distancia, time.monotonic(), True):
+            return
+    except Exception:
+        CONTROL_SALUDOS.reiniciar_muestras()
+        return
+    saludo = "Hola, qué gusto verte hoy."
+    print(f"[Saludo autónomo] {saludo}")
+    # No abrir ventana de conversación ni pedir respuesta; no usar Ollama.
+    hablar(saludo, aplicar_emocion_final=False)
+    if ULTIMA_VOZ_COMPLETA:
+        enviar_emocion("happy", modo="natural", duracion_ms=NATURAL_EMOTION_DURATION_MS)
+
+
 def main():
     global MICROFONO_ACTUAL, APAGANDO
 
@@ -3292,17 +3752,37 @@ def main():
     hablar("Charsbotai iniciado.")
 
     activo = False
+    limite_continuacion = None
 
     try:
+        print("[Visión] " + iniciar_vision_al_arrancar())
+        iniciar_control_escritorio()
         print("\nEscuchando. En modo espera solo responderé cuando digas \"robot\".\n")
 
         while True:
+            # La llamada simple "robot" conserva su comportamiento previo.
+            # El plazo se aplica únicamente a una conversación de seguimiento.
+            tiempo_espera = None
+            if limite_continuacion is not None:
+                restante = limite_continuacion - time.monotonic()
+                if restante <= 0:
+                    activo = False
+                    limite_continuacion = None
+                    print("Tiempo de respuesta agotado. Di 'robot' para activarme.\n")
+                else:
+                    tiempo_espera = min(SHERPA_WAIT_FOR_VOICE_SECONDS, restante)
+
             revisar_inactividad(activo)
 
-            audio = capturar_frase_inteligente(microfono)
+            # Solo acortar el sondeo cuando exista telemetría real integrada.
+            if saludos_listos_para_sondeo(activo):
+                tiempo_espera = 1.0
+            audio = capturar_frase_inteligente(microfono, tiempo_espera=tiempo_espera)
 
             if not audio:
+                revisar_saludo_en_silencio(activo)
                 continue
+            CONTROL_SALUDOS.reiniciar_muestras()  # Prioridad absoluta a la voz humana.
 
             # Con Silero ya sabemos que existe voz humana.
             # Solo en el modo de respaldo RMS aplicamos el filtro anterior.
@@ -3397,26 +3877,37 @@ def main():
                     print(f"Charsbotai: {respuesta}\n")
                     hablar(respuesta)
 
-                activo = False
-                print("Charsbotai volvió al modo espera.\n")
+                activo, limite_continuacion = estado_despues_de_responder(respuesta)
                 continue
 
             # ----------------------------------------------------------
-            # Ya estaba activo porque antes dijeron solamente "robot".
+            # Ya estaba activo porque antes dijeron solamente "robot"
+            # o porque Charsbotai estaba esperando una contestación.
             # ----------------------------------------------------------
             print("Charsbotai: Pensando...")
             enviar_emocion("thinking")
 
+            # En la continuación también se permite repetir el nombre,
+            # pero solo se retira si aparece al principio de la frase.
+            mensaje_activo = texto
+            if limite_continuacion is not None:
+                texto_inicio = texto_normalizado.lstrip(" ,.:;¿?¡!")
+                for palabra in sorted(WAKE_WORDS, key=len, reverse=True):
+                    coincidencia = re.match(rf"{re.escape(normalizar_texto(palabra))}\b", texto_inicio)
+                    if coincidencia:
+                        resto = texto_inicio[coincidencia.end():].lstrip(" ,.:;¿?¡!")
+                        if resto:
+                            mensaje_activo = resto
+                        break
             respuesta, ya_fue_hablada = procesar_mensaje_con_streaming(
-                texto
+                mensaje_activo
             )
 
             if not ya_fue_hablada:
                 print(f"Charsbotai: {respuesta}\n")
                 hablar(respuesta)
 
-            activo = False
-            print("Charsbotai volvió al modo espera.\n")
+            activo, limite_continuacion = estado_despues_de_responder(respuesta)
 
     except KeyboardInterrupt:
         APAGANDO = True
@@ -3429,9 +3920,11 @@ def main():
 
     finally:
         APAGANDO = True
+        cerrar_control_escritorio()
+        cerrar_camara()
         liberar_cancelacion_eco()
         desconectar_socket_silenciosamente()
 
-
 if __name__ == "__main__":
     main()
+    

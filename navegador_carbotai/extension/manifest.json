@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Carbotai - Control local de Chromium",
+  "version": "1.4.0",
+  "description": "Control local de ventanas y pestañas mediante mensajería nativa. Sin scripts en páginas, sin conexión de red propia.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArYIboHFDTi5Qq2RQt/LB79wP/ShwaZ9GZlRR61LErKujThirkYy2o1Q6j3AcVeti9ntdXAY4jlj7Gx9v49kefHl02OeTYyfh3QU8iR4GH1qQJmZY6yYCCA7R6yu/1WW2NbpSsjxk3S7Ub9x7f6SnOpM2GzUS4MHNWYkA9ecL+OWc323396tbFqupLUELUNLgBtq321QQVKeXhuqt9WAjYZJ/BmUtiBnj55ZXqkj27vhK1ifC6qXrOCUA+RhOUcPlBjOb/7C0/xS8ixhO/fbNpMMse0go4e8TJ5N7xfo6XywmHNsxDDx1eSRfXItCc2CfvennpFYM2GlSCs4sHJNoLQIDAQAB",
+  "permissions": [
+    "tabs",
+    "nativeMessaging",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Carbotai - conexión local"
+  }
+}

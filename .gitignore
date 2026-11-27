@@ -54,3 +54,6 @@ temp/
 Thumbs.db
 .idea/
 .vscode/
+# Copias de respaldo locales de Carbotai
+*.bak-*
+navegador_carbotai.bak-*/
